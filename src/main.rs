@@ -269,6 +269,29 @@ async fn main() {
         "Starting acp-bridge"
     );
 
+    // Probe backend: check connectivity and list available models
+    match llm::probe_backend(&config).await {
+        Ok(models) if models.is_empty() => {
+            info!("Connected to backend (no models listed)");
+        }
+        Ok(models) => {
+            info!(count = models.len(), "Available models:");
+            for m in &models {
+                info!("  - {m}");
+            }
+            if !models.iter().any(|m| m.starts_with(&config.model) || config.model.starts_with(m.split(':').next().unwrap_or(""))) {
+                warn!(configured = %config.model, "Configured model not found in available models");
+            }
+        }
+        Err(reason) => {
+            warn!(
+                base_url = %config.base_url,
+                error = %reason,
+                "Cannot reach backend — will retry on first request"
+            );
+        }
+    }
+
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();

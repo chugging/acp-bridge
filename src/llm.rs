@@ -7,6 +7,62 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Probe the backend on startup: check connectivity and list available models.
+/// Returns Ok(model_list) on success, Err(reason) on failure.
+/// Non-fatal — callers should log the result but not abort.
+pub async fn probe_backend(config: &LlmConfig) -> Result<Vec<String>, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    // Try Ollama-native /api/tags first (works on localhost:11434)
+    let base = config.base_url.trim_end_matches("/v1").trim_end_matches('/');
+    let tags_url = format!("{base}/api/tags");
+
+    if let Ok(resp) = client.get(&tags_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(val) = resp.json::<Value>().await {
+                let models: Vec<String> = val["models"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m["name"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(models);
+            }
+        }
+    }
+
+    // Fallback: try /v1/models (OpenAI-compatible)
+    let models_url = format!("{}/models", config.base_url);
+    match client
+        .get(&models_url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(val) = resp.json::<Value>().await {
+                let models: Vec<String> = val["data"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m["id"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(models);
+            }
+            Ok(vec![])
+        }
+        Ok(resp) => Err(format!("HTTP {}", resp.status())),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
 /// Maximum number of retry attempts for transient LLM HTTP errors.
 const MAX_RETRIES: u32 = 3;
 /// Initial backoff delay in milliseconds (doubles each retry).
