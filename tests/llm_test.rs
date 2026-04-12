@@ -1,8 +1,10 @@
 use acp_bridge::llm::LlmConfig;
+use std::sync::Mutex;
 
-#[test]
-fn config_defaults() {
-    // Clear any env vars that might interfere
+/// Env-var-based config tests must run serially to avoid race conditions.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn clear_env_vars() {
     std::env::remove_var("LLM_BASE_URL");
     std::env::remove_var("OLLAMA_BASE_URL");
     std::env::remove_var("LLM_MODEL");
@@ -13,6 +15,12 @@ fn config_defaults() {
     std::env::remove_var("LLM_MAX_TOKENS");
     std::env::remove_var("LLM_TIMEOUT");
     std::env::remove_var("LLM_MAX_HISTORY_TURNS");
+}
+
+#[test]
+fn config_defaults() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_env_vars();
 
     let config = LlmConfig::from_env();
 
@@ -27,6 +35,9 @@ fn config_defaults() {
 
 #[test]
 fn config_from_llm_env_vars() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_env_vars();
+
     std::env::set_var("LLM_BASE_URL", "http://gpu-server:8000/v1");
     std::env::set_var("LLM_MODEL", "llama3:8b");
     std::env::set_var("LLM_API_KEY", "secret-key");
@@ -45,21 +56,14 @@ fn config_from_llm_env_vars() {
     assert_eq!(config.timeout_secs, 120);
     assert_eq!(config.max_history_turns, 20);
 
-    // Cleanup
-    std::env::remove_var("LLM_BASE_URL");
-    std::env::remove_var("LLM_MODEL");
-    std::env::remove_var("LLM_API_KEY");
-    std::env::remove_var("LLM_TEMPERATURE");
-    std::env::remove_var("LLM_MAX_TOKENS");
-    std::env::remove_var("LLM_TIMEOUT");
-    std::env::remove_var("LLM_MAX_HISTORY_TURNS");
+    clear_env_vars();
 }
 
 #[test]
 fn config_ollama_fallback_vars() {
-    std::env::remove_var("LLM_BASE_URL");
-    std::env::remove_var("LLM_MODEL");
-    std::env::remove_var("LLM_API_KEY");
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_env_vars();
+
     std::env::set_var("OLLAMA_BASE_URL", "http://ollama:11434/v1");
     std::env::set_var("OLLAMA_MODEL", "qwen2:7b");
     std::env::set_var("OLLAMA_API_KEY", "ollama-key");
@@ -70,16 +74,17 @@ fn config_ollama_fallback_vars() {
     assert_eq!(config.model, "qwen2:7b");
     assert_eq!(config.api_key, "ollama-key");
 
-    // Cleanup
-    std::env::remove_var("OLLAMA_BASE_URL");
-    std::env::remove_var("OLLAMA_MODEL");
-    std::env::remove_var("OLLAMA_API_KEY");
+    clear_env_vars();
 }
 
 #[test]
 fn config_invalid_temperature_ignored() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_env_vars();
+
     std::env::set_var("LLM_TEMPERATURE", "not-a-number");
     let config = LlmConfig::from_env();
     assert!(config.temperature.is_none());
-    std::env::remove_var("LLM_TEMPERATURE");
+
+    clear_env_vars();
 }
