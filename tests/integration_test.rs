@@ -34,7 +34,10 @@ fn mock_llm_error_router() -> Router {
 }
 
 async fn mock_chat_completions_error() -> impl IntoResponse {
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "LLM backend error")
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "LLM backend error",
+    )
 }
 
 async fn mock_models() -> impl IntoResponse {
@@ -55,7 +58,10 @@ async fn mock_chat_completions(req: Request<Body>) -> impl IntoResponse {
         .unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
 
-    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if stream {
         let chunks = vec![
@@ -220,7 +226,9 @@ async fn test_session_new_and_end() {
     let session_id = resp["result"]["sessionId"].as_str().unwrap().to_string();
     assert!(!session_id.is_empty());
 
-    h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/end","params":{"sessionId": session_id}}));
+    h.send(
+        &json!({"jsonrpc":"2.0","id":3,"method":"session/end","params":{"sessionId": session_id}}),
+    );
     let resp = h.read_line();
     assert_eq!(resp["id"], 3);
     assert_eq!(resp["result"]["status"], "ended");
@@ -250,7 +258,11 @@ async fn test_session_prompt_streaming() {
     let text_chunks: Vec<String> = notifications
         .iter()
         .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
-        .filter_map(|m| m["params"]["update"]["content"]["text"].as_str().map(String::from))
+        .filter_map(|m| {
+            m["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(String::from)
+        })
         .collect();
     let full_text: String = text_chunks.join("");
     assert_eq!(full_text, "Hello world");

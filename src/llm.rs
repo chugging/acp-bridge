@@ -304,8 +304,13 @@ pub async fn stream_chat(
                 Ok(Some(bytes)) => {
                     let chunk_str = String::from_utf8_lossy(&bytes);
                     if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
-                        error!("Stream buffer exceeded {}MB limit, aborting", MAX_BUFFER_SIZE / 1024 / 1024);
-                        let _ = tx.send(StreamChunk::Error("Stream buffer overflow".into())).await;
+                        error!(
+                            "Stream buffer exceeded {}MB limit, aborting",
+                            MAX_BUFFER_SIZE / 1024 / 1024
+                        );
+                        let _ = tx
+                            .send(StreamChunk::Error("Stream buffer overflow".into()))
+                            .await;
                         return;
                     }
                     buffer.push_str(&chunk_str);

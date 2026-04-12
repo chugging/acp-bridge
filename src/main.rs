@@ -45,10 +45,7 @@ fn handle_initialize(id: u64, config: &llm::LlmConfig) {
 }
 
 fn handle_session_new(id: u64, params: &Value, config: &llm::LlmConfig) {
-    let raw_cwd = params
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/tmp");
+    let raw_cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("/tmp");
 
     // Sanitize cwd: only allow typical path characters to prevent prompt injection.
     let cwd: String = raw_cwd
