@@ -284,6 +284,7 @@ async fn main() {
         version = env!("CARGO_PKG_VERSION"),
         model = %config.model,
         base_url = %config.base_url,
+        ollama_native = config.is_ollama_native(),
         max_history_turns = config.max_history_turns,
         max_sessions = config.max_sessions,
         session_idle_timeout_secs = config.session_idle_timeout_secs,
@@ -313,6 +314,30 @@ async fn main() {
                 error = %reason,
                 "Cannot reach backend — will retry on first request"
             );
+        }
+    }
+
+    // Query model info (Ollama native only)
+    if let Some(info) = llm::query_model_info(&config).await {
+        info!(
+            context_length = info.context_length,
+            "Model info from /api/show"
+        );
+    }
+
+    // Check running models (Ollama)
+    if let Some(running) = llm::query_running_models(&config).await {
+        if running.is_empty() {
+            warn!(
+                model = %config.model,
+                "No models loaded in VRAM — first request may be slow. Run: ollama run {}",
+                config.model
+            );
+        } else {
+            info!(count = running.len(), "Running models (loaded in VRAM):");
+            for m in &running {
+                info!("  - {m}");
+            }
         }
     }
 

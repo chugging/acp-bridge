@@ -667,3 +667,213 @@ async fn test_nan_temperature_ignored() {
 
     h.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1: Ollama native API mocks
+// ---------------------------------------------------------------------------
+
+/// Mock Ollama native API router (/api/chat, /api/show, /api/ps, /api/tags)
+fn mock_ollama_native_router() -> Router {
+    Router::new()
+        .route("/api/tags", get(mock_ollama_tags))
+        .route("/api/chat", post(mock_ollama_native_chat))
+        .route("/api/show", post(mock_ollama_show))
+        .route("/api/ps", get(mock_ollama_ps))
+}
+
+/// Ollama native /api/chat streaming — NDJSON format (NOT SSE)
+async fn mock_ollama_native_chat(req: Request<Body>) -> impl IntoResponse {
+    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(true); // Ollama defaults to streaming
+
+    if stream {
+        // Ollama native streaming: each line is a JSON object (NDJSON)
+        let chunks = vec![
+            format!(
+                "{}\n",
+                json!({
+                    "model": "test-model",
+                    "created_at": "2026-04-14T00:00:00Z",
+                    "message": {"role": "assistant", "content": "Ollama"},
+                    "done": false
+                })
+            ),
+            format!(
+                "{}\n",
+                json!({
+                    "model": "test-model",
+                    "created_at": "2026-04-14T00:00:01Z",
+                    "message": {"role": "assistant", "content": " native"},
+                    "done": false
+                })
+            ),
+            format!(
+                "{}\n",
+                json!({
+                    "model": "test-model",
+                    "created_at": "2026-04-14T00:00:02Z",
+                    "message": {"role": "assistant", "content": ""},
+                    "done": true,
+                    "total_duration": 1000000000i64,
+                    "eval_count": 10
+                })
+            ),
+        ];
+
+        let stream =
+            futures_lite::stream::iter(chunks.into_iter().map(Ok::<_, std::convert::Infallible>));
+
+        axum::response::Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap()
+            .into_response()
+    } else {
+        axum::Json(json!({
+            "model": "test-model",
+            "created_at": "2026-04-14T00:00:00Z",
+            "message": {"role": "assistant", "content": "Ollama native"},
+            "done": true,
+            "total_duration": 1000000000i64,
+            "eval_count": 10
+        }))
+        .into_response()
+    }
+}
+
+/// Ollama /api/show — returns model info including context length
+async fn mock_ollama_show() -> impl IntoResponse {
+    axum::Json(json!({
+        "modelfile": "FROM test-model",
+        "parameters": "num_ctx 8192",
+        "model_info": {
+            "general.architecture": "gemma2",
+            "general.parameter_count": 26000000000u64,
+            "gemma2.context_length": 8192
+        }
+    }))
+}
+
+/// Ollama /api/ps — returns running models
+async fn mock_ollama_ps() -> impl IntoResponse {
+    axum::Json(json!({
+        "models": [{
+            "name": "test-model:latest",
+            "model": "test-model:latest",
+            "size": 15000000000u64,
+            "digest": "abc123",
+            "details": {
+                "family": "gemma2",
+                "parameter_size": "26B",
+                "quantization_level": "Q4_K_M"
+            },
+            "expires_at": "2026-04-14T01:00:00Z",
+            "size_vram": 15000000000u64
+        }]
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Ollama native integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ollama_native_streaming() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_ollama_native_router(),
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hello"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    let text_chunks: Vec<String> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|m| {
+            m["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(String::from)
+        })
+        .collect();
+    let full_text: String = text_chunks.join("");
+    assert_eq!(
+        full_text, "Ollama native",
+        "Should parse Ollama native NDJSON streaming"
+    );
+    assert_eq!(response["result"]["status"], "completed");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ollama_auto_detect_native() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_ollama_native_router(),
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    let resp = h.read_line();
+    assert!(resp["result"]["agentInfo"]["name"]
+        .as_str()
+        .unwrap()
+        .contains("acp-bridge"));
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ollama_openai_compat_still_works() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_router(),
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hello"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    let text_chunks: Vec<String> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|m| {
+            m["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(String::from)
+        })
+        .collect();
+    let full_text: String = text_chunks.join("");
+    assert_eq!(full_text, "Hello world", "OpenAI compat should still work");
+    assert_eq!(response["result"]["status"], "completed");
+
+    h.shutdown();
+}
