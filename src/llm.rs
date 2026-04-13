@@ -1,5 +1,5 @@
-//! Local AI HTTP client — streams chat completions via SSE.
-//! Supports any OpenAI-compatible API: Ollama, LocalAI, vLLM, llama.cpp, LM Studio, etc.
+//! Local AI HTTP client — streams chat completions via SSE or NDJSON.
+//! Supports Ollama native API (/api/chat) and any OpenAI-compatible API.
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -63,6 +63,64 @@ pub async fn probe_backend(config: &LlmConfig) -> Result<Vec<String>, String> {
     }
 }
 
+/// Query Ollama /api/show for model metadata (context length, etc.).
+/// Returns None if not an Ollama backend or request fails.
+pub async fn query_model_info(config: &LlmConfig) -> Option<ModelInfo> {
+    if !config.is_ollama_native() {
+        return None;
+    }
+    let url = format!("{}/api/show", config.base_url);
+    let resp = config
+        .client
+        .post(&url)
+        .json(&json!({"name": config.model}))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let val: Value = resp.json().await.ok()?;
+
+    // Extract context length from model_info
+    let model_info = val.get("model_info")?;
+    let context_length = model_info
+        .as_object()?
+        .iter()
+        .find(|(k, _)| k.ends_with(".context_length"))
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or(0);
+
+    Some(ModelInfo { context_length })
+}
+
+/// Query Ollama /api/ps to check if a model is loaded in VRAM.
+pub async fn query_running_models(config: &LlmConfig) -> Option<Vec<String>> {
+    let base = config
+        .base_url
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let url = format!("{base}/api/ps");
+    let resp = config.client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let val: Value = resp.json().await.ok()?;
+    let models: Vec<String> = val["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(models)
+}
+
+pub struct ModelInfo {
+    pub context_length: u64,
+}
+
 /// Maximum number of retry attempts for transient LLM HTTP errors.
 const MAX_RETRIES: u32 = 3;
 /// Initial backoff delay in milliseconds (doubles each retry).
@@ -86,6 +144,20 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
+    /// Returns true if the base_url points to an Ollama native API (no /v1 suffix).
+    pub fn is_ollama_native(&self) -> bool {
+        !self.base_url.ends_with("/v1")
+    }
+
+    /// Returns the chat completion URL based on backend type.
+    fn chat_url(&self) -> String {
+        if self.is_ollama_native() {
+            format!("{}/api/chat", self.base_url)
+        } else {
+            format!("{}/chat/completions", self.base_url)
+        }
+    }
+
     pub fn from_env() -> Self {
         let timeout_secs = std::env::var("LLM_TIMEOUT")
             .ok()
@@ -159,7 +231,7 @@ fn build_body(
         "stream": stream,
     });
     if let Some(temp) = config.temperature {
-        // Clamp to valid OpenAI range 0.0–2.0
+        // Clamp to valid range 0.0–2.0
         body["temperature"] = json!(temp.clamp(0.0, 2.0));
     }
     if let Some(max) = config.max_tokens {
@@ -178,7 +250,7 @@ pub async fn chat(
     model_override: Option<&str>,
     tools: Option<&[Value]>,
 ) -> Result<Value, String> {
-    let url = format!("{}/chat/completions", config.base_url);
+    let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
     let client = &config.client;
 
@@ -217,7 +289,6 @@ pub async fn chat(
                 warn!(status = %response.status(), "Transient LLM error");
             }
             Ok(response) => {
-                // Non-retryable HTTP error
                 return Err(format!(
                     "LLM HTTP {}: {}",
                     response.status(),
@@ -239,15 +310,16 @@ pub async fn chat(
     Err(last_err)
 }
 
-/// Stream chat completion from any OpenAI-compatible endpoint.
+/// Stream chat completion — auto-detects backend and uses appropriate parser.
 pub async fn stream_chat(
     config: &LlmConfig,
     messages: &[Value],
     model_override: Option<&str>,
 ) -> Result<mpsc::Receiver<StreamChunk>, String> {
-    let url = format!("{}/chat/completions", config.base_url);
+    let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
     let client = &config.client;
+    let is_native = config.is_ollama_native();
 
     let body = build_body(config, messages, model, true, None);
 
@@ -308,80 +380,152 @@ pub async fn stream_chat(
 
     let (tx, rx) = mpsc::channel(256);
 
-    tokio::spawn(async move {
-        let mut response = response;
-        let mut buffer = String::new();
-        /// Maximum stream buffer size (10 MB) to prevent unbounded memory growth.
-        const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+    if is_native {
+        tokio::spawn(parse_ollama_native_stream(response, tx));
+    } else {
+        tokio::spawn(parse_openai_sse_stream(response, tx));
+    }
 
-        loop {
-            let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
-            match chunk_result {
-                Ok(Some(bytes)) => {
-                    let chunk_str = String::from_utf8_lossy(&bytes);
-                    if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
-                        error!(
-                            "Stream buffer exceeded {}MB limit, aborting",
-                            MAX_BUFFER_SIZE / 1024 / 1024
-                        );
-                        let _ = tx
-                            .send(StreamChunk::Error("Stream buffer overflow".into()))
-                            .await;
-                        return;
+    info!(model, native = is_native, "Streaming started");
+    Ok(rx)
+}
+
+/// Parse Ollama native NDJSON streaming response.
+/// Each line is a complete JSON object: {"message":{"content":"..."},"done":false}
+async fn parse_ollama_native_stream(
+    mut response: reqwest::Response,
+    tx: mpsc::Sender<StreamChunk>,
+) {
+    let mut buffer = String::new();
+    const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+
+    loop {
+        let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
+        match chunk_result {
+            Ok(Some(bytes)) => {
+                let chunk_str = String::from_utf8_lossy(&bytes);
+                if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
+                    error!("Stream buffer exceeded limit, aborting");
+                    let _ = tx
+                        .send(StreamChunk::Error("Stream buffer overflow".into()))
+                        .await;
+                    return;
+                }
+                buffer.push_str(&chunk_str);
+
+                while let Some(newline_pos) = buffer.find('\n').or_else(|| buffer.find('\r')) {
+                    let line = buffer[..newline_pos].trim_end().to_string();
+                    let skip = if buffer[newline_pos..].starts_with("\r\n") {
+                        2
+                    } else {
+                        1
+                    };
+                    buffer = buffer[newline_pos + skip..].to_string();
+
+                    if line.is_empty() {
+                        continue;
                     }
-                    buffer.push_str(&chunk_str);
 
-                    // Handle both \r\n (HTTP standard) and \n line endings.
-                    while let Some(newline_pos) = buffer.find('\n').or_else(|| buffer.find('\r')) {
-                        let line = buffer[..newline_pos].trim_end().to_string();
-                        // Skip past \r\n or \n
-                        let skip = if buffer[newline_pos..].starts_with("\r\n") {
-                            2
-                        } else {
-                            1
-                        };
-                        buffer = buffer[newline_pos + skip..].to_string();
-
-                        if line.is_empty() || !line.starts_with("data: ") {
-                            continue;
-                        }
-
-                        let data = &line[6..];
-                        if data == "[DONE]" {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
+                        // Check if done
+                        if parsed.get("done").and_then(|d| d.as_bool()) == Some(true) {
                             let _ = tx.send(StreamChunk::Done).await;
                             return;
                         }
 
-                        if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                            if let Some(text) = parsed
-                                .get("choices")
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c.get("delta"))
-                                .and_then(|d| d.get("content"))
-                                .and_then(|t| t.as_str())
-                            {
-                                if !text.is_empty() {
-                                    let _ = tx.send(StreamChunk::Content(text.to_string())).await;
-                                }
+                        // Extract content from message.content
+                        if let Some(text) = parsed
+                            .get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            if !text.is_empty() {
+                                let _ = tx.send(StreamChunk::Content(text.to_string())).await;
                             }
                         }
                     }
                 }
-                Ok(None) => {
-                    debug!("Stream ended (no more chunks)");
-                    break;
-                }
-                Err(e) => {
-                    error!(error = %e, "Stream chunk error");
-                    let _ = tx.send(StreamChunk::Error(e.to_string())).await;
-                    break;
-                }
+            }
+            Ok(None) => {
+                debug!("Ollama native stream ended");
+                break;
+            }
+            Err(e) => {
+                error!(error = %e, "Stream chunk error");
+                let _ = tx.send(StreamChunk::Error(e.to_string())).await;
+                break;
             }
         }
+    }
 
-        let _ = tx.send(StreamChunk::Done).await;
-    });
+    let _ = tx.send(StreamChunk::Done).await;
+}
 
-    info!(model, "Streaming started");
-    Ok(rx)
+/// Parse OpenAI-compatible SSE streaming response.
+/// Each line: "data: {json}" or "data: [DONE]"
+async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Sender<StreamChunk>) {
+    let mut buffer = String::new();
+    const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+
+    loop {
+        let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
+        match chunk_result {
+            Ok(Some(bytes)) => {
+                let chunk_str = String::from_utf8_lossy(&bytes);
+                if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
+                    error!("Stream buffer exceeded limit, aborting");
+                    let _ = tx
+                        .send(StreamChunk::Error("Stream buffer overflow".into()))
+                        .await;
+                    return;
+                }
+                buffer.push_str(&chunk_str);
+
+                while let Some(newline_pos) = buffer.find('\n').or_else(|| buffer.find('\r')) {
+                    let line = buffer[..newline_pos].trim_end().to_string();
+                    let skip = if buffer[newline_pos..].starts_with("\r\n") {
+                        2
+                    } else {
+                        1
+                    };
+                    buffer = buffer[newline_pos + skip..].to_string();
+
+                    if line.is_empty() || !line.starts_with("data: ") {
+                        continue;
+                    }
+
+                    let data = &line[6..];
+                    if data == "[DONE]" {
+                        let _ = tx.send(StreamChunk::Done).await;
+                        return;
+                    }
+
+                    if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+                        if let Some(text) = parsed
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("delta"))
+                            .and_then(|d| d.get("content"))
+                            .and_then(|t| t.as_str())
+                        {
+                            if !text.is_empty() {
+                                let _ = tx.send(StreamChunk::Content(text.to_string())).await;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                debug!("SSE stream ended");
+                break;
+            }
+            Err(e) => {
+                error!(error = %e, "Stream chunk error");
+                let _ = tx.send(StreamChunk::Error(e.to_string())).await;
+                break;
+            }
+        }
+    }
+
+    let _ = tx.send(StreamChunk::Done).await;
 }
