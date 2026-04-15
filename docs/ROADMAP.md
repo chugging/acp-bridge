@@ -31,17 +31,12 @@
   v0.2.1  ✅ Sprint 1 — 安全性修復 (CWD injection, error response, buffer cap)
   v0.3.0  ✅ Sprint 2 — 穩定性改善 (SSE parsing, connection pool, session TTL)
   v0.4.0  ✅ Phase 1 — Ollama 原生整合 (/api/chat, /api/show, /api/ps)
+  v0.5.0  ✅ Phase 2 — Built-in tools (read_file, list_dir, search_code)
     │
     │                                        你在這裡 ★
     │
-    ├─ Wave 1 宣傳                           現在開始
-    │   └─ 目標: "讓人知道你存在"
-    │
-    ├─ Phase 2: MCP Server 模式 (v0.5.0)     ~2 週
-    │   └─ 目標: "Ollama model 變成 MCP tool，能讀檔案"
-    │
-    ├─ Wave 2 宣傳                           Phase 2 完成後
-    │   └─ 目標: "直接跟 Ollama 社群對話，提 PR 到 integrations"
+    ├─ Wave 1+2 宣傳                         現在開始
+    │   └─ 目標: "Ollama 社群 + r/LocalLLaMA + 台灣 AI 社群"
     │
     ├─ Phase 3: A2A 遷移 (v0.6.0)           ~2 週
     │   └─ 目標: "跟上標準，ACP → A2A"
@@ -192,7 +187,7 @@
 
 ---
 
-## Phase 2: MCP Server 模式 (v0.5.0)
+## Phase 2: Built-in Tools (v0.5.0) ✅ 已完成
 
 ### 為什麼要做
 
@@ -341,8 +336,8 @@
   規則: 每個 Phase 一個 MINOR，hotfix 用 PATCH
 
   v0.3.0  ✅ 已發佈 (Sprint 1 + 2)
-  v0.4.0  Phase 1 — Ollama 原生整合
-  v0.5.0  Phase 2 — MCP Server 模式
+  v0.4.0  ✅ Phase 1 — Ollama 原生整合
+  v0.5.0  ✅ Phase 2 — Built-in tools
   v0.6.0  Phase 3 — A2A 遷移
   v1.0.0  全部穩定後
 ```
