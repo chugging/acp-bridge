@@ -21,16 +21,27 @@ pub struct Session {
     pub working_dir: PathBuf,
     /// 客户端发送 `session/cancel` 后置位；下一轮 `session/prompt` 开始时清零。
     pub cancelled: AtomicBool,
+    /// ACP session mode: `ask` | `plan` | `agent`（与 JetBrains / ACP `configOptions` 对齐）。
+    pub mode: String,
+    /// 本会话使用的后端模型 id（可由 `session/set_config_option` 覆盖）。
+    pub model: String,
 }
 
 impl Session {
-    pub fn new(system_message: Value, working_dir: PathBuf) -> Self {
+    pub fn new(system_message: Value, working_dir: PathBuf, model: String) -> Self {
         Self {
             messages: vec![system_message],
             last_active: Instant::now(),
             working_dir,
             cancelled: AtomicBool::new(false),
+            mode: "agent".into(),
+            model,
         }
+    }
+
+    /// 是否为协议支持的三种模式之一。
+    pub fn is_valid_mode(mode: &str) -> bool {
+        matches!(mode, "ask" | "plan" | "agent")
     }
 
     /// 由客户端取消当前 prompt 轮次时调用。

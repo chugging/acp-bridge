@@ -73,6 +73,14 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// 按 ACP session 模式返回可调用的工具定义（Ask 模式禁用全部工具）。
+pub fn tool_definitions_for_mode(mode: &str) -> Vec<Value> {
+    match mode {
+        "ask" => vec![],
+        _ => tool_definitions(),
+    }
+}
+
 /// Resolve and validate a path within the sandbox.
 /// Returns None if the path escapes the working directory.
 fn resolve_sandboxed_path(working_dir: &Path, relative_path: &str) -> Option<PathBuf> {

@@ -32,6 +32,10 @@ const MAX_TOOL_ROUNDS: usize = 5;
 static SESSIONS: std::sync::LazyLock<RwLock<HashMap<String, Session>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// 后台探活拉取到的模型列表；`session/new` 与 `session/set_config_option` 复用。
+static CACHED_BACKEND_MODELS: std::sync::LazyLock<RwLock<Vec<String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
+
 // ---------------------------------------------------------------------------
 // Session helpers
 // ---------------------------------------------------------------------------
@@ -54,6 +58,131 @@ fn sessions_read() -> std::sync::RwLockReadGuard<'static, HashMap<String, Sessio
             p.into_inner()
         }
     }
+}
+
+fn cached_models_read() -> std::sync::RwLockReadGuard<'static, Vec<String>> {
+    match CACHED_BACKEND_MODELS.read() {
+        Ok(m) => m,
+        Err(p) => {
+            warn!("Model cache lock poisoned, recovering");
+            p.into_inner()
+        }
+    }
+}
+
+fn cached_models_write() -> std::sync::RwLockWriteGuard<'static, Vec<String>> {
+    match CACHED_BACKEND_MODELS.write() {
+        Ok(m) => m,
+        Err(p) => {
+            warn!("Model cache lock poisoned, recovering");
+            p.into_inner()
+        }
+    }
+}
+
+/// 保证默认配置的模型出现在下拉列表中。
+fn merge_models_with_default(config: &llm::LlmConfig, mut models: Vec<String>) -> Vec<String> {
+    if !models.iter().any(|m| m == &config.model) {
+        models.insert(0, config.model.clone());
+    }
+    models
+}
+
+/// 解析可用模型列表（优先缓存，否则同步探活一次）。
+async fn resolve_model_list(config: &llm::LlmConfig) -> Vec<String> {
+    {
+        let cached = cached_models_read();
+        if !cached.is_empty() {
+            return merge_models_with_default(config, cached.clone());
+        }
+    }
+    match llm::probe_backend(config).await {
+        Ok(list) if !list.is_empty() => {
+            *cached_models_write() = list.clone();
+            merge_models_with_default(config, list)
+        }
+        _ => vec![config.model.clone()],
+    }
+}
+
+fn mode_instructions(mode: &str) -> &'static str {
+    match mode {
+        "ask" => "You are in Ask mode. Answer conversationally without using workspace tools; if you need file contents, ask the user to paste them.",
+        "plan" => "You are in Plan mode. Produce clear plans and tradeoffs; use read-only tools only when they substantially improve the plan.",
+        "agent" => "You are in Agent mode. Use the provided tools when they help you give accurate, actionable answers.",
+        _ => "",
+    }
+}
+
+/// 为 LLM 请求构造消息列表：在系统提示后附加当前模式说明。
+fn augment_messages_for_llm(messages: &[Value], mode: &str) -> Vec<Value> {
+    if messages.is_empty() {
+        return vec![];
+    }
+    let mut out = messages.to_vec();
+    if out[0].get("role").and_then(|r| r.as_str()) == Some("system") {
+        let base = out[0]
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        let suffix = mode_instructions(mode);
+        let combined = if suffix.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}\n\n{suffix}")
+        };
+        out[0] = json!({"role": "system", "content": combined});
+    }
+    out
+}
+
+fn build_config_options(session: &Session, models: &[String]) -> Vec<Value> {
+    let model_options: Vec<Value> = models
+        .iter()
+        .map(|m| {
+            json!({
+                "value": m,
+                "name": m,
+                "description": serde_json::Value::Null
+            })
+        })
+        .collect();
+
+    vec![
+        json!({
+            "id": "mode",
+            "name": "Session mode",
+            "description": "Ask: chat only. Plan: structured planning with read-only exploration. Agent: full tool use.",
+            "category": "mode",
+            "type": "select",
+            "currentValue": session.mode,
+            "options": [
+                {"value": "ask", "name": "Ask", "description": "Answer without running workspace tools."},
+                {"value": "plan", "name": "Plan", "description": "Focus on plans and analysis; read-only tools when helpful."},
+                {"value": "agent", "name": "Agent", "description": "Use tools to inspect the project and respond accurately."}
+            ]
+        }),
+        json!({
+            "id": "model",
+            "name": "Model",
+            "description": "Backend language model for this session.",
+            "category": "model",
+            "type": "select",
+            "currentValue": session.model,
+            "options": model_options
+        }),
+    ]
+}
+
+fn modes_state_json(current: &str) -> Value {
+    json!({
+        "currentModeId": current,
+        "availableModes": [
+            {"id": "ask", "name": "Ask", "description": "Answer without running workspace tools."},
+            {"id": "plan", "name": "Plan", "description": "Focus on plans and analysis; read-only tools when helpful."},
+            {"id": "agent", "name": "Agent", "description": "Use tools to inspect the project and respond accurately."}
+        ]
+    })
 }
 
 /// Evict sessions that have been idle longer than the timeout.
@@ -124,7 +253,7 @@ fn handle_session_cancel(params: &Value) {
     }
 }
 
-fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig) {
+async fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig) {
     // Enforce max_sessions limit
     if config.max_sessions > 0 {
         let count = sessions_read().len();
@@ -151,14 +280,169 @@ fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig) {
         format!("You are a helpful coding assistant. The user's working directory is: {cwd}")
     });
 
+    let models = resolve_model_list(config).await;
+    let initial_model = config.model.clone();
+
     let session = Session::new(
         json!({"role": "system", "content": system_prompt}),
         PathBuf::from(&cwd),
+        initial_model,
     );
     sessions_write().insert(session_id.clone(), session);
 
+    let (config_options, modes) = {
+        let sessions = sessions_read();
+        let session = sessions.get(&session_id).expect("session just inserted");
+        (
+            build_config_options(session, &models),
+            modes_state_json(&session.mode),
+        )
+    };
+
     info!(session_id = %session_id, max_history = config.max_history_turns, "New session");
-    acp::send_response(id, json!({"sessionId": session_id}));
+    acp::send_response(
+        id,
+        json!({
+            "sessionId": session_id,
+            "configOptions": config_options,
+            "modes": modes
+        }),
+    );
+}
+
+/// `session/set_config_option` — 更新模式或模型后返回完整 `configOptions`。
+async fn handle_session_set_config_option(id: &Value, params: &Value, config: &llm::LlmConfig) {
+    let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let err = AcpError::MissingParam {
+                field: "sessionId".into(),
+            };
+            acp::send_error(id, err.code(), &err.to_string());
+            return;
+        }
+    };
+    let config_id = match params.get("configId").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let err = AcpError::MissingParam {
+                field: "configId".into(),
+            };
+            acp::send_error(id, err.code(), &err.to_string());
+            return;
+        }
+    };
+    let value = match params.get("value").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let err = AcpError::MissingParam {
+                field: "value".into(),
+            };
+            acp::send_error(id, err.code(), &err.to_string());
+            return;
+        }
+    };
+
+    let models = resolve_model_list(config).await;
+
+    match config_id.as_str() {
+        "mode" => {
+            if !Session::is_valid_mode(&value) {
+                acp::send_error(
+                    id,
+                    -32602,
+                    "Invalid mode value (expected ask, plan, or agent)",
+                );
+                return;
+            }
+        }
+        "model" => {
+            if !models.iter().any(|m| m == &value) {
+                acp::send_error(
+                    id,
+                    -32602,
+                    "Model value is not in the available models list",
+                );
+                return;
+            }
+        }
+        _ => {
+            acp::send_error(
+                id,
+                -32602,
+                &format!("Unknown config option: {config_id}"),
+            );
+            return;
+        }
+    }
+
+    let mut sessions = sessions_write();
+    let session = match sessions.get_mut(&session_id) {
+        Some(s) => s,
+        None => {
+            let err = AcpError::UnknownSession {
+                session_id: session_id.clone(),
+            };
+            acp::send_error(id, err.code(), &err.to_string());
+            return;
+        }
+    };
+
+    match config_id.as_str() {
+        "mode" => {
+            session.mode = value;
+        }
+        "model" => {
+            session.model = value;
+        }
+        _ => {}
+    }
+
+    let opts = build_config_options(session, &models);
+    acp::send_response(id, json!({ "configOptions": opts }));
+}
+
+fn handle_session_set_mode(id: &Value, params: &Value) {
+    let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let err = AcpError::MissingParam {
+                field: "sessionId".into(),
+            };
+            acp::send_error(id, err.code(), &err.to_string());
+            return;
+        }
+    };
+    let mode_id = match params.get("modeId").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            let err = AcpError::MissingParam {
+                field: "modeId".into(),
+            };
+            acp::send_error(id, err.code(), &err.to_string());
+            return;
+        }
+    };
+
+    if !Session::is_valid_mode(&mode_id) {
+        acp::send_error(
+            id,
+            -32602,
+            "Invalid modeId (expected ask, plan, or agent)",
+        );
+        return;
+    }
+
+    let mut sessions = sessions_write();
+    let Some(session) = sessions.get_mut(&session_id) else {
+        let err = AcpError::UnknownSession {
+            session_id: session_id.clone(),
+        };
+        acp::send_error(id, err.code(), &err.to_string());
+        return;
+    };
+    session.mode = mode_id;
+    acp::send_response(id, json!({}));
 }
 
 async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConfig) {
@@ -185,8 +469,8 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
         })
         .unwrap_or_default();
 
-    // Add user message, touch session, and trim history
-    {
+    // Add user message, touch session, trim history, snapshot mode/model for this turn
+    let (session_mode, session_model) = {
         let mut sessions = sessions_write();
         let session = match sessions.get_mut(&session_id) {
             Some(s) => s,
@@ -212,7 +496,8 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
                 debug!(before, after, "Trimmed conversation history");
             }
         }
-    }
+        (session.mode.clone(), session.model.clone())
+    };
 
     let llm_tool_id = Uuid::new_v4().to_string();
     acp::notify_thinking(&session_id);
@@ -225,7 +510,6 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
 
     let mut had_error = false;
     let mut cancelled_turn = false;
-    let tool_defs = tools::tool_definitions();
 
     // Tool call loop: LLM may request tools, we execute and feed results back
     for round in 0..MAX_TOOL_ROUNDS {
@@ -238,13 +522,14 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
             break;
         }
 
-        let messages = {
+        let messages_raw = {
             let sessions = sessions_read();
             sessions
                 .get(&session_id)
                 .map(|s| s.messages.clone())
                 .unwrap_or_default()
         };
+        let messages = augment_messages_for_llm(&messages_raw, &session_mode);
 
         let working_dir = {
             let sessions = sessions_read();
@@ -254,8 +539,21 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
                 .unwrap_or_default()
         };
 
+        let tool_defs = tools::tool_definitions_for_mode(session_mode.as_str());
+        let tools_arg = if tool_defs.is_empty() {
+            None
+        } else {
+            Some(tool_defs.as_slice())
+        };
+
         // Try non-streaming first to check for tool calls
-        let chat_result = llm::chat(config, &messages, None, Some(&tool_defs)).await;
+        let chat_result = llm::chat(
+            config,
+            &messages,
+            Some(session_model.as_str()),
+            tools_arg,
+        )
+        .await;
 
         match chat_result {
             Ok(response) => {
@@ -477,6 +775,9 @@ async fn main() {
                 info!("Connected to backend (no models listed)");
             }
             Ok(models) => {
+                if !models.is_empty() {
+                    *cached_models_write() = models.clone();
+                }
                 info!(count = models.len(), "Available models:");
                 for m in &models {
                     info!("  - {m}");
@@ -577,7 +878,11 @@ async fn main() {
 
                         match method {
                             "initialize" => handle_initialize(req_id, &params, &config),
-                            "session/new" => handle_session_new(req_id, &params, &config),
+                            "session/new" => handle_session_new(req_id, &params, &config).await,
+                            "session/set_config_option" => {
+                                handle_session_set_config_option(req_id, &params, &config).await
+                            }
+                            "session/set_mode" => handle_session_set_mode(req_id, &params),
                             "session/prompt" => {
                                 handle_session_prompt(req_id, &params, &config).await
                             }

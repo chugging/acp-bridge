@@ -294,6 +294,52 @@ async fn test_session_new_and_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_new_config_options_and_set_config_option() {
+    let port = free_port();
+    let mut h = TestHarness::start(port).await;
+
+    h.send(
+        &json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp/test","mcpServers":[]}}),
+    );
+    let resp = h.read_line();
+    assert_eq!(resp["id"], 2);
+    let r = &resp["result"];
+    let session_id = r["sessionId"].as_str().unwrap();
+    let opts = r["configOptions"].as_array().expect("configOptions");
+    assert_eq!(opts.len(), 2);
+    assert_eq!(opts[0]["id"], "mode");
+    assert_eq!(opts[0]["category"], "mode");
+    assert_eq!(opts[0]["currentValue"], "agent");
+    assert_eq!(opts[1]["id"], "model");
+    assert_eq!(opts[1]["category"], "model");
+    assert_eq!(opts[1]["currentValue"], "test-model");
+    let modes = &r["modes"];
+    assert_eq!(modes["currentModeId"], "agent");
+    assert!(modes["availableModes"].as_array().unwrap().len() >= 3);
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":3,
+        "method":"session/set_config_option",
+        "params":{"sessionId": session_id, "configId": "mode", "value": "ask"}
+    }));
+    let resp = h.read_line();
+    assert_eq!(resp["id"], 3);
+    let opts = resp["result"]["configOptions"].as_array().unwrap();
+    assert_eq!(opts[0]["currentValue"], "ask");
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":4,
+        "method":"session/set_mode",
+        "params":{"sessionId": session_id, "modeId": "plan"}
+    }));
+    let resp = h.read_line();
+    assert_eq!(resp["id"], 4);
+    assert_eq!(resp["result"], json!({}));
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_session_prompt_streaming() {
     let port = free_port();
     let mut h = TestHarness::start(port).await;
