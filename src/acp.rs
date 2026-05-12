@@ -12,12 +12,12 @@ pub fn send(obj: &Value) {
 }
 
 /// Send a JSON-RPC success response.
-pub fn send_response(id: u64, result: Value) {
+pub fn send_response(id: &Value, result: Value) {
     send(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
 }
 
 /// Send a JSON-RPC error response.
-pub fn send_error(id: u64, code: i64, message: &str) {
+pub fn send_error(id: &Value, code: i64, message: &str) {
     send(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}));
 }
 
