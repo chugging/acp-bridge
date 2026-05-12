@@ -487,20 +487,19 @@ async fn main() {
                             }
                         };
 
-                        let id = msg.id;
                         let method = msg.method.as_str();
                         let params = msg.params.clone().unwrap_or(json!({}));
 
-                        debug!(id, method, "Received request");
+                        debug!(request_id = ?msg.id, %method, "Received request");
 
                         match method {
-                            "initialize" => handle_initialize(id, &config),
-                            "session/new" => handle_session_new(id, &params, &config),
-                            "session/prompt" => handle_session_prompt(id, &params, &config).await,
-                            "session/end" => handle_session_end(id, &params),
+                            "initialize" => handle_initialize(&msg.id, &config),
+                            "session/new" => handle_session_new(&msg.id, &params, &config),
+                            "session/prompt" => handle_session_prompt(&msg.id, &params, &config).await,
+                            "session/end" => handle_session_end(&msg.id, &params),
                             _ => {
                                 let err = AcpError::MethodNotFound { method: method.to_string() };
-                                acp::send_error(id, err.code(), &err.to_string());
+                                acp::send_error(&msg.id, err.code(), &err.to_string());
                             }
                         }
                     }
