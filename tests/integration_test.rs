@@ -288,7 +288,7 @@ async fn test_session_new_and_end() {
     );
     let resp = h.read_line();
     assert_eq!(resp["id"], 3);
-    assert_eq!(resp["result"]["status"], "ended");
+    assert_eq!(resp["result"], json!({}));
 
     h.shutdown();
 }
@@ -338,7 +338,7 @@ async fn test_session_prompt_streaming() {
     assert!(has_tool_start, "Should have tool_call notification");
     assert!(has_tool_done, "Should have tool_call_update notification");
 
-    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
 
     h.shutdown();
 }
@@ -430,7 +430,7 @@ async fn test_full_conversation_flow() {
         "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"first"}]}
     }));
     let (_, resp) = h.read_until_response(3);
-    assert_eq!(resp["result"]["status"], "completed");
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
 
     // Second prompt (multi-turn)
     h.send(&json!({
@@ -438,12 +438,12 @@ async fn test_full_conversation_flow() {
         "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"second"}]}
     }));
     let (_, resp) = h.read_until_response(4);
-    assert_eq!(resp["result"]["status"], "completed");
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
 
     // End session
     h.send(&json!({"jsonrpc":"2.0","id":5,"method":"session/end","params":{"sessionId":&sid}}));
     let resp = h.read_line();
-    assert_eq!(resp["result"]["status"], "ended");
+    assert_eq!(resp["result"], json!({}));
 
     // Double-end → error
     h.send(&json!({"jsonrpc":"2.0","id":6,"method":"session/end","params":{"sessionId":&sid}}));
@@ -467,7 +467,7 @@ async fn test_empty_prompt_text() {
         "params":{"sessionId":&sid,"prompt":[]}
     }));
     let (_, resp) = h.read_until_response(2);
-    assert_eq!(resp["result"]["status"], "completed");
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
 
     h.shutdown();
 }
@@ -507,7 +507,7 @@ async fn test_cwd_injection_sanitized() {
         "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"test"}]}
     }));
     let (_, resp) = h.read_until_response(2);
-    assert_eq!(resp["result"]["status"], "completed");
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
 
     h.shutdown();
 }
@@ -553,7 +553,7 @@ async fn test_llm_error_returns_response() {
     let (notifications, resp) = h.read_until_response(2);
     assert_eq!(resp["id"], 2);
     // Should indicate failure
-    assert_eq!(resp["result"]["status"], "failed");
+    assert_eq!(resp["result"]["stopReason"], "refusal");
 
     // Should have error notification
     let has_error_text = notifications.iter().any(|m| {
@@ -598,7 +598,7 @@ async fn test_sse_crlf_line_endings() {
         .collect();
     let full_text: String = text_chunks.join("");
     assert_eq!(full_text, "CRLF works", "Should parse \\r\\n SSE correctly");
-    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
 
     h.shutdown();
 }
@@ -663,7 +663,7 @@ async fn test_nan_temperature_ignored() {
     }));
     let (_, resp) = h.read_until_response(2);
     assert_eq!(
-        resp["result"]["status"], "completed",
+        resp["result"]["stopReason"], "end_turn",
         "Should work even with nan temperature"
     );
 
@@ -818,7 +818,7 @@ async fn test_ollama_native_streaming() {
         full_text, "Ollama native",
         "Should parse Ollama native NDJSON streaming"
     );
-    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
 
     h.shutdown();
 }
@@ -875,7 +875,7 @@ async fn test_ollama_openai_compat_still_works() {
         .collect();
     let full_text: String = text_chunks.join("");
     assert_eq!(full_text, "Hello world", "OpenAI compat should still work");
-    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
 
     h.shutdown();
 }
@@ -1003,7 +1003,7 @@ async fn test_tool_call_list_dir() {
         "Should get final text response after tool call, got: {full_text}"
     );
 
-    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
 
     h.shutdown();
 }

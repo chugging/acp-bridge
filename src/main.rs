@@ -100,11 +100,28 @@ fn handle_initialize(id: &Value, params: &Value, config: &llm::LlmConfig) {
                     "embeddedContext": false,
                     "image": false
                 },
-                "sessionCapabilities": {}
+                "sessionCapabilities": {
+                    "close": {}
+                }
             },
             "authMethods": []
         }),
     );
+}
+
+/// 处理客户端 `session/cancel` 通知：在当前会话上置取消位（无 JSON-RPC 响应）。
+fn handle_session_cancel(params: &Value) {
+    let Some(sid) = params.get("sessionId").and_then(|v| v.as_str()) else {
+        warn!("session/cancel missing sessionId");
+        return;
+    };
+    let sessions = sessions_read();
+    if let Some(s) = sessions.get(sid) {
+        s.request_cancel();
+        info!(session_id = sid, "session/cancel received");
+    } else {
+        warn!(session_id = sid, "session/cancel for unknown session");
+    }
 }
 
 fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig) {
@@ -181,6 +198,7 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
                 return;
             }
         };
+        session.clear_cancel();
         session.touch();
         session
             .messages
@@ -196,14 +214,30 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
         }
     }
 
-    acp::notify_thinking();
-    acp::notify_tool_start("llm_chat");
+    let llm_tool_id = Uuid::new_v4().to_string();
+    acp::notify_thinking(&session_id);
+    acp::notify_tool_start(
+        &session_id,
+        &llm_tool_id,
+        "LLM chat",
+        acp::infer_tool_kind("llm_chat"),
+    );
 
     let mut had_error = false;
+    let mut cancelled_turn = false;
     let tool_defs = tools::tool_definitions();
 
     // Tool call loop: LLM may request tools, we execute and feed results back
     for round in 0..MAX_TOOL_ROUNDS {
+        if sessions_read()
+            .get(&session_id)
+            .map(|s| s.is_cancelled())
+            .unwrap_or(false)
+        {
+            cancelled_turn = true;
+            break;
+        }
+
         let messages = {
             let sessions = sessions_read();
             sessions
@@ -232,7 +266,7 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
                     // No tool calls — extract text and stream it
                     let text = extract_response_text(&response);
                     if !text.is_empty() {
-                        acp::notify_text(&text);
+                        acp::notify_text(&session_id, &text);
                         let mut sessions = sessions_write();
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session
@@ -267,9 +301,11 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
                     let args: Value = serde_json::from_str(args_str)
                         .unwrap_or_else(|_| func["arguments"].clone());
 
-                    acp::notify_tool_start(name);
+                    let tool_call_id = Uuid::new_v4().to_string();
+                    let kind = acp::infer_tool_kind(name);
+                    acp::notify_tool_start(&session_id, &tool_call_id, name, kind);
                     let result = tools::execute_tool(&working_dir, name, &args);
-                    acp::notify_tool_done(name, "completed");
+                    acp::notify_tool_done(&session_id, &tool_call_id, "completed");
 
                     debug!(tool = name, result_len = result.len(), "Tool executed");
 
@@ -290,22 +326,28 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
             Err(e) => {
                 let err = AcpError::LlmError { reason: e };
                 error!(error = %err, "LLM communication failed");
-                acp::notify_text(&format!("\n\n**Error:** {err}\n"));
+                acp::notify_text(&session_id, &format!("\n\n**Error:** {err}\n"));
                 had_error = true;
                 break;
             }
         }
     }
 
-    let status = if had_error { "failed" } else { "completed" };
-    acp::notify_tool_done("llm_chat", status);
-    let stop_reason = if had_error { "refusal" } else { "end_turn" };
-    acp::send_response(
-        id,
-        json!({
-            "stopReason": if had_error { "refusal" } else { "end_turn" }
-        }),
-    );
+    let llm_tool_status = if cancelled_turn || had_error {
+        "failed"
+    } else {
+        "completed"
+    };
+    acp::notify_tool_done(&session_id, &llm_tool_id, llm_tool_status);
+
+    let stop_reason = if cancelled_turn {
+        "cancelled"
+    } else if had_error {
+        "refusal"
+    } else {
+        "end_turn"
+    };
+    acp::send_response(id, json!({ "stopReason": stop_reason }));
 }
 
 /// Extract tool calls from an LLM response (supports both Ollama and OpenAI format).
@@ -376,7 +418,7 @@ fn handle_session_end(id: &Value, params: &Value) {
 
     if removed {
         info!(session_id = %session_id, "Session ended");
-        acp::send_response(id, json!({"status": "ended"}));
+        acp::send_response(id, json!({}));
     } else {
         let err = AcpError::UnknownSession { session_id };
         acp::send_error(id, err.code(), &err.to_string());
@@ -427,55 +469,61 @@ async fn main() {
         "Starting acp-bridge"
     );
 
-    // Probe backend
-    match llm::probe_backend(&config).await {
-        Ok(models) if models.is_empty() => {
-            info!("Connected to backend (no models listed)");
-        }
-        Ok(models) => {
-            info!(count = models.len(), "Available models:");
-            for m in &models {
-                info!("  - {m}");
+    // 后台探活：避免阻塞 stdin，防止 IDE 在 `initialize` 前因超时发送 SIGTERM。
+    let probe_cfg = config.clone();
+    tokio::spawn(async move {
+        match llm::probe_backend(&probe_cfg).await {
+            Ok(models) if models.is_empty() => {
+                info!("Connected to backend (no models listed)");
             }
-            if !models.iter().any(|m| {
-                m.starts_with(&config.model)
-                    || config.model.starts_with(m.split(':').next().unwrap_or(""))
-            }) {
-                warn!(configured = %config.model, "Configured model not found in available models");
+            Ok(models) => {
+                info!(count = models.len(), "Available models:");
+                for m in &models {
+                    info!("  - {m}");
+                }
+                if !models.iter().any(|m| {
+                    m.starts_with(&probe_cfg.model)
+                        || probe_cfg
+                            .model
+                            .starts_with(m.split(':').next().unwrap_or(""))
+                }) {
+                    warn!(
+                        configured = %probe_cfg.model,
+                        "Configured model not found in available models"
+                    );
+                }
+            }
+            Err(reason) => {
+                warn!(
+                    base_url = %probe_cfg.base_url,
+                    error = %reason,
+                    "Cannot reach backend — will retry on first request"
+                );
             }
         }
-        Err(reason) => {
-            warn!(
-                base_url = %config.base_url,
-                error = %reason,
-                "Cannot reach backend — will retry on first request"
+
+        if let Some(info) = llm::query_model_info(&probe_cfg).await {
+            info!(
+                context_length = info.context_length,
+                "Model info from /api/show"
             );
         }
-    }
 
-    // Query model info (Ollama native only)
-    if let Some(info) = llm::query_model_info(&config).await {
-        info!(
-            context_length = info.context_length,
-            "Model info from /api/show"
-        );
-    }
-
-    // Check running models (Ollama)
-    if let Some(running) = llm::query_running_models(&config).await {
-        if running.is_empty() {
-            warn!(
-                model = %config.model,
-                "No models loaded in VRAM — first request may be slow. Run: ollama run {}",
-                config.model
-            );
-        } else {
-            info!(count = running.len(), "Running models (loaded in VRAM):");
-            for m in &running {
-                info!("  - {m}");
+        if let Some(running) = llm::query_running_models(&probe_cfg).await {
+            if running.is_empty() {
+                warn!(
+                    model = %probe_cfg.model,
+                    "No models loaded in VRAM — first request may be slow. Run: ollama run {}",
+                    probe_cfg.model
+                );
+            } else {
+                info!(count = running.len(), "Running models (loaded in VRAM):");
+                for m in &running {
+                    info!("  - {m}");
+                }
             }
         }
-    }
+    });
 
     // Spawn idle session cleanup task
     let idle_timeout = config.session_idle_timeout_secs;
@@ -514,16 +562,29 @@ async fn main() {
                         let method = msg.method.as_str();
                         let params = msg.params.clone().unwrap_or(json!({}));
 
-                        debug!(request_id = ?msg.id, %method, "Received request");
+                        if method == "session/cancel" {
+                            debug!(request_id = ?msg.id, "Received session/cancel");
+                            handle_session_cancel(&params);
+                            continue;
+                        }
+
+                        let Some(req_id) = msg.id.as_ref() else {
+                            debug!(%method, "Skipping non-request line without id");
+                            continue;
+                        };
+
+                        debug!(request_id = ?req_id, %method, "Received request");
 
                         match method {
-                            "initialize" => handle_initialize(&msg.id, &params, &config),
-                            "session/new" => handle_session_new(&msg.id, &params, &config),
-                            "session/prompt" => handle_session_prompt(&msg.id, &params, &config).await,
-                            "session/end" => handle_session_end(&msg.id, &params),
+                            "initialize" => handle_initialize(req_id, &params, &config),
+                            "session/new" => handle_session_new(req_id, &params, &config),
+                            "session/prompt" => {
+                                handle_session_prompt(req_id, &params, &config).await
+                            }
+                            "session/end" | "session/close" => handle_session_end(req_id, &params),
                             _ => {
                                 let err = AcpError::MethodNotFound { method: method.to_string() };
-                                acp::send_error(&msg.id, err.code(), &err.to_string());
+                                acp::send_error(req_id, err.code(), &err.to_string());
                             }
                         }
                     }

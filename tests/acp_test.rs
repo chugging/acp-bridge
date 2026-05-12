@@ -1,14 +1,12 @@
-/// Verify JSON-RPC message structure matches ACP spec.
-/// Since acp::send writes directly to stdout, we test the JSON shapes independently.
+/// 验证 JSON-RPC 响应结构（与 ACP 一致）。
+/// 由于 `acp::send` 直接写 stdout，此处仅校验 JSON 形状。
 
 #[test]
 fn json_rpc_response_structure() {
-    // Construct what send_response would produce
-    let id = 1u64;
+    let id = serde_json::json!(1);
     let result = serde_json::json!({"agentInfo": {"name": "test", "version": "0.1.0"}});
     let msg = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
 
-    // Verify structure
     assert_eq!(msg["jsonrpc"], "2.0");
     assert_eq!(msg["id"], 1);
     assert!(msg["result"]["agentInfo"]["name"].is_string());
@@ -16,7 +14,7 @@ fn json_rpc_response_structure() {
 
 #[test]
 fn json_rpc_error_structure() {
-    let id = 5u64;
+    let id = serde_json::json!(5);
     let code = -32601i64;
     let message = "Method not found: foo";
     let msg = serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}});
@@ -27,12 +25,19 @@ fn json_rpc_error_structure() {
 
 #[test]
 fn notification_has_no_id() {
-    let method = "session/notify";
-    let params = serde_json::json!({"update": {"sessionUpdate": "agent_message_chunk", "content": {"text": "hi"}}});
+    let method = "session/update";
+    let params = serde_json::json!({
+        "sessionId": "sid-1",
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hi"}
+        }
+    });
     let msg = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params});
 
     assert!(msg.get("id").is_none());
-    assert_eq!(msg["method"], "session/notify");
+    assert_eq!(msg["method"], "session/update");
+    assert_eq!(msg["params"]["sessionId"], "sid-1");
     assert_eq!(
         msg["params"]["update"]["sessionUpdate"],
         "agent_message_chunk"
@@ -42,20 +47,41 @@ fn notification_has_no_id() {
 #[test]
 fn notification_text_content_format() {
     let text = "Hello, world!";
-    let params = serde_json::json!({"update": {"sessionUpdate": "agent_message_chunk", "content": {"text": text}}});
+    let params = serde_json::json!({
+        "sessionId": "s",
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text}
+        }
+    });
 
     assert_eq!(
         params["update"]["content"]["text"].as_str().unwrap(),
         "Hello, world!"
     );
+    assert_eq!(params["update"]["content"]["type"], "text");
 }
 
 #[test]
 fn tool_call_notification_format() {
-    let title = "llm_chat";
-    let params = serde_json::json!({"update": {"sessionUpdate": "tool_call", "title": title}});
-    assert_eq!(params["update"]["title"], "llm_chat");
+    let params = serde_json::json!({
+        "sessionId": "s",
+        "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "read_file",
+            "kind": "read"
+        }
+    });
+    assert_eq!(params["update"]["toolCallId"], "tc-1");
 
-    let done_params = serde_json::json!({"update": {"sessionUpdate": "tool_call_update", "title": title, "status": "completed"}});
+    let done_params = serde_json::json!({
+        "sessionId": "s",
+        "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-1",
+            "status": "completed"
+        }
+    });
     assert_eq!(done_params["update"]["status"], "completed");
 }

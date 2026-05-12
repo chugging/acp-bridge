@@ -1,11 +1,14 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+/// JSON-RPC 请求行（stdin 一行）。`id` 可为空：客户端通知（如 `session/cancel`）无 `id`。
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
-    pub id: Value,
+    #[serde(default)]
+    pub id: Option<Value>,
     pub method: String,
     pub params: Option<Value>,
 }
@@ -16,6 +19,8 @@ pub struct Session {
     pub last_active: Instant,
     /// Working directory for this session (used for tool sandboxing).
     pub working_dir: PathBuf,
+    /// 客户端发送 `session/cancel` 后置位；下一轮 `session/prompt` 开始时清零。
+    pub cancelled: AtomicBool,
 }
 
 impl Session {
@@ -24,7 +29,23 @@ impl Session {
             messages: vec![system_message],
             last_active: Instant::now(),
             working_dir,
+            cancelled: AtomicBool::new(false),
         }
+    }
+
+    /// 由客户端取消当前 prompt 轮次时调用。
+    pub fn request_cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// 是否已请求取消（供 prompt 循环轮询）。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// 新一轮用户 prompt 开始时清除取消标志。
+    pub fn clear_cancel(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
     }
 
     pub fn touch(&mut self) {

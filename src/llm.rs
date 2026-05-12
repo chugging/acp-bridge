@@ -126,6 +126,7 @@ const MAX_RETRIES: u32 = 3;
 /// Initial backoff delay in milliseconds (doubles each retry).
 const INITIAL_BACKOFF_MS: u64 = 500;
 
+#[derive(Clone)]
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
