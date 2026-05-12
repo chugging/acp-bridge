@@ -300,7 +300,12 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
     let status = if had_error { "failed" } else { "completed" };
     acp::notify_tool_done("llm_chat", status);
     let stop_reason = if had_error { "refusal" } else { "end_turn" };
-    acp::send_response(id, json!({ "stopReason": stop_reason }
+    acp::send_response(
+        id,
+        json!({
+            "stopReason": if had_error { "refusal" } else { "end_turn" }
+        }),
+    );
 }
 
 /// Extract tool calls from an LLM response (supports both Ollama and OpenAI format).
