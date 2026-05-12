@@ -75,7 +75,7 @@ fn evict_idle_sessions(timeout_secs: u64) {
 // ACP method handlers
 // ---------------------------------------------------------------------------
 
-fn handle_initialize(id: u64, config: &llm::LlmConfig) {
+fn handle_initialize(id: &Value, config: &llm::LlmConfig) {
     info!(model = %config.model, base_url = %config.base_url, "Initialize");
     acp::send_response(
         id,
@@ -89,7 +89,7 @@ fn handle_initialize(id: u64, config: &llm::LlmConfig) {
     );
 }
 
-fn handle_session_new(id: u64, params: &Value, config: &llm::LlmConfig) {
+fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig) {
     // Enforce max_sessions limit
     if config.max_sessions > 0 {
         let count = sessions_read().len();
@@ -126,7 +126,7 @@ fn handle_session_new(id: u64, params: &Value, config: &llm::LlmConfig) {
     acp::send_response(id, json!({"sessionId": session_id}));
 }
 
-async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig) {
+async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConfig) {
     let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -336,7 +336,7 @@ fn extract_response_text(response: &Value) -> String {
     String::new()
 }
 
-fn handle_session_end(id: u64, params: &Value) {
+fn handle_session_end(id: &Value, params: &Value) {
     let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
