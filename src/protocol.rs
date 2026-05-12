@@ -5,7 +5,7 @@ use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
-    pub id: u64,
+    pub id: Value,
     pub method: String,
     pub params: Option<Value>,
 }
