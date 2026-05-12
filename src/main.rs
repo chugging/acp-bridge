@@ -75,16 +75,34 @@ fn evict_idle_sessions(timeout_secs: u64) {
 // ACP method handlers
 // ---------------------------------------------------------------------------
 
-fn handle_initialize(id: &Value, config: &llm::LlmConfig) {
-    info!(model = %config.model, base_url = %config.base_url, "Initialize");
+fn handle_initialize(id: &Value, params: &Value, config: &llm::LlmConfig) {
+    let client_pv = params
+        .get("protocolVersion")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+        .unwrap_or(1);
+    let negotiated = client_pv.min(1);
+
+    info!(model = %config.model, base_url = %config.base_url, negotiated, "Initialize");
+
     acp::send_response(
         id,
         json!({
+            "protocolVersion": negotiated,
             "agentInfo": {
                 "name": format!("acp-bridge ({})", config.model),
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "capabilities": {}
+            "agentCapabilities": {
+                "loadSession": false,
+                "mcpCapabilities": { "http": false, "sse": false },
+                "promptCapabilities": {
+                    "audio": false,
+                    "embeddedContext": false,
+                    "image": false
+                },
+                "sessionCapabilities": {}
+            },
+            "authMethods": []
         }),
     );
 }
@@ -493,7 +511,7 @@ async fn main() {
                         debug!(request_id = ?msg.id, %method, "Received request");
 
                         match method {
-                            "initialize" => handle_initialize(&msg.id, &config),
+                            "initialize" => handle_initialize(&msg.id, &params, &config),
                             "session/new" => handle_session_new(&msg.id, &params, &config),
                             "session/prompt" => handle_session_prompt(&msg.id, &params, &config).await,
                             "session/end" => handle_session_end(&msg.id, &params),
