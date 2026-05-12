@@ -88,20 +88,20 @@ fn merge_models_with_default(config: &llm::LlmConfig, mut models: Vec<String>) -
     models
 }
 
-/// 解析可用模型列表（优先缓存，否则同步探活一次）。
-async fn resolve_model_list(config: &llm::LlmConfig) -> Vec<String> {
-    {
-        let cached = cached_models_read();
-        if !cached.is_empty() {
-            return merge_models_with_default(config, cached.clone());
-        }
-    }
-    match llm::probe_backend(config).await {
-        Ok(list) if !list.is_empty() => {
-            *cached_models_write() = list.clone();
-            merge_models_with_default(config, list)
-        }
-        _ => vec![config.model.clone()],
+/// 供 `configOptions` 使用的模型列表：**只读**后台探活写入的缓存，不在此处发起 HTTP。
+///
+/// 若在探活完成前创建会话，列表仅含当前配置的 `LLM_MODEL`；探活结束后缓存更新，
+/// 新开会话或 `session/set_config_option` 会拿到完整列表。这样 `session/new` 永不阻塞
+/// stdin 主循环，避免 JetBrains 等客户端因响应超时发送 SIGTERM（退出码 143）。
+fn model_list_for_config_options(config: &llm::LlmConfig) -> Vec<String> {
+    let cached = cached_models_read();
+    if !cached.is_empty() {
+        merge_models_with_default(config, cached.clone())
+    } else {
+        debug!(
+            "Model cache empty — configOptions list only configured model until probe completes"
+        );
+        vec![config.model.clone()]
     }
 }
 
@@ -253,7 +253,7 @@ fn handle_session_cancel(params: &Value) {
     }
 }
 
-async fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig) {
+fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig) {
     // Enforce max_sessions limit
     if config.max_sessions > 0 {
         let count = sessions_read().len();
@@ -280,7 +280,7 @@ async fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig)
         format!("You are a helpful coding assistant. The user's working directory is: {cwd}")
     });
 
-    let models = resolve_model_list(config).await;
+    let models = model_list_for_config_options(config);
     let initial_model = config.model.clone();
 
     let session = Session::new(
@@ -311,7 +311,7 @@ async fn handle_session_new(id: &Value, params: &Value, config: &llm::LlmConfig)
 }
 
 /// `session/set_config_option` — 更新模式或模型后返回完整 `configOptions`。
-async fn handle_session_set_config_option(id: &Value, params: &Value, config: &llm::LlmConfig) {
+fn handle_session_set_config_option(id: &Value, params: &Value, config: &llm::LlmConfig) {
     let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -343,7 +343,7 @@ async fn handle_session_set_config_option(id: &Value, params: &Value, config: &l
         }
     };
 
-    let models = resolve_model_list(config).await;
+    let models = model_list_for_config_options(config);
 
     match config_id.as_str() {
         "mode" => {
@@ -878,9 +878,9 @@ async fn main() {
 
                         match method {
                             "initialize" => handle_initialize(req_id, &params, &config),
-                            "session/new" => handle_session_new(req_id, &params, &config).await,
+                            "session/new" => handle_session_new(req_id, &params, &config),
                             "session/set_config_option" => {
-                                handle_session_set_config_option(req_id, &params, &config).await
+                                handle_session_set_config_option(req_id, &params, &config)
                             }
                             "session/set_mode" => handle_session_set_mode(req_id, &params),
                             "session/prompt" => {
