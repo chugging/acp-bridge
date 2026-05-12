@@ -25,6 +25,8 @@ pub struct Session {
     pub mode: String,
     /// 本会话使用的后端模型 id（可由 `session/set_config_option` 覆盖）。
     pub model: String,
+    /// 是否正有一条 `session/prompt` 在后台执行（防止并发写 `messages`）。
+    pub prompt_in_flight: AtomicBool,
 }
 
 impl Session {
@@ -36,6 +38,7 @@ impl Session {
             cancelled: AtomicBool::new(false),
             mode: "agent".into(),
             model,
+            prompt_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -97,6 +100,9 @@ pub enum AcpError {
 
     #[error("Session limit reached (max: {max})")]
     SessionLimitReached { max: usize },
+
+    #[error("Session busy: prompt already in progress for {session_id}")]
+    SessionBusy { session_id: String },
 }
 
 impl AcpError {
@@ -108,6 +114,7 @@ impl AcpError {
             AcpError::MethodNotFound { .. } => -32601, // Method not found
             AcpError::LlmError { .. } => -32003,       // Application error
             AcpError::SessionLimitReached { .. } => -32004, // Application error
+            AcpError::SessionBusy { .. } => -32005,    // Application error
         }
     }
 }

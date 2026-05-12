@@ -16,6 +16,7 @@ use acp_bridge::tools;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -445,17 +446,31 @@ fn handle_session_set_mode(id: &Value, params: &Value) {
     acp::send_response(id, json!({}));
 }
 
-async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConfig) {
-    let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            let err = AcpError::MissingParam {
-                field: "sessionId".into(),
-            };
-            acp::send_error(id, err.code(), &err.to_string());
-            return;
+/// 在 `handle_session_prompt` 返回或 panic 时清除 `Session::prompt_in_flight`。
+struct PromptInFlightClear {
+    session_id: String,
+}
+
+impl Drop for PromptInFlightClear {
+    fn drop(&mut self) {
+        if let Some(s) = sessions_write().get_mut(&self.session_id) {
+            s.prompt_in_flight.store(false, Ordering::SeqCst);
         }
-    };
+    }
+}
+
+/// 在主线程同步完成：校验、`prompt_in_flight` 占位、写入用户消息。失败时返回 `Err`（未改会话）。
+fn session_prompt_prepare(
+    params: &Value,
+    config: &llm::LlmConfig,
+) -> Result<(String, String, String), AcpError> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| AcpError::MissingParam {
+            field: "sessionId".into(),
+        })?;
 
     let user_text = params
         .get("prompt")
@@ -469,19 +484,22 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
         })
         .unwrap_or_default();
 
-    // Add user message, touch session, trim history, snapshot mode/model for this turn
     let (session_mode, session_model) = {
         let mut sessions = sessions_write();
-        let session = match sessions.get_mut(&session_id) {
-            Some(s) => s,
-            None => {
-                let err = AcpError::UnknownSession {
-                    session_id: session_id.clone(),
-                };
-                acp::send_error(id, err.code(), &err.to_string());
-                return;
-            }
-        };
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| AcpError::UnknownSession {
+                session_id: session_id.clone(),
+            })?;
+        if session
+            .prompt_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(AcpError::SessionBusy {
+                session_id: session_id.clone(),
+            });
+        }
         session.clear_cancel();
         session.touch();
         session
@@ -497,6 +515,20 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
             }
         }
         (session.mode.clone(), session.model.clone())
+    };
+
+    Ok((session_id, session_mode, session_model))
+}
+
+async fn session_prompt_execute(
+    id: Value,
+    session_id: String,
+    session_mode: String,
+    session_model: String,
+    config: llm::LlmConfig,
+) {
+    let _prompt_in_flight_guard = PromptInFlightClear {
+        session_id: session_id.clone(),
     };
 
     let llm_tool_id = Uuid::new_v4().to_string();
@@ -548,7 +580,7 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
 
         // Try non-streaming first to check for tool calls
         let chat_result = llm::chat(
-            config,
+            &config,
             &messages,
             Some(session_model.as_str()),
             tools_arg,
@@ -645,7 +677,7 @@ async fn handle_session_prompt(id: &Value, params: &Value, config: &llm::LlmConf
     } else {
         "end_turn"
     };
-    acp::send_response(id, json!({ "stopReason": stop_reason }));
+    acp::send_response(&id, json!({ "stopReason": stop_reason }));
 }
 
 /// Extract tool calls from an LLM response (supports both Ollama and OpenAI format).
@@ -884,7 +916,18 @@ async fn main() {
                             }
                             "session/set_mode" => handle_session_set_mode(req_id, &params),
                             "session/prompt" => {
-                                handle_session_prompt(req_id, &params, &config).await
+                                match session_prompt_prepare(&params, &config) {
+                                    Ok((sid, smode, smodel)) => {
+                                        let id = req_id.clone();
+                                        let cfg = config.clone();
+                                        tokio::spawn(async move {
+                                            session_prompt_execute(id, sid, smode, smodel, cfg).await;
+                                        });
+                                    }
+                                    Err(e) => {
+                                        acp::send_error(req_id, e.code(), &e.to_string());
+                                    }
+                                }
                             }
                             "session/end" | "session/close" => handle_session_end(req_id, &params),
                             _ => {

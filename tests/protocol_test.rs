@@ -160,4 +160,10 @@ fn acp_error_codes() {
     let limit = AcpError::SessionLimitReached { max: 10 };
     assert_eq!(limit.code(), -32004);
     assert!(limit.to_string().contains("10"));
+
+    let busy = AcpError::SessionBusy {
+        session_id: "s1".into(),
+    };
+    assert_eq!(busy.code(), -32005);
+    assert!(busy.to_string().contains("s1"));
 }
